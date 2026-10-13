@@ -1,0 +1,4 @@
+pyspark==4.2.0
+delta-spark==4.2.0
+pytest
+ruff

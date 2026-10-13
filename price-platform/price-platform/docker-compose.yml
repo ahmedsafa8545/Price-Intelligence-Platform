@@ -1,0 +1,190 @@
+name: price-intelligence
+
+# ---------- Airflow (مشترك بين كل خدمات Airflow) ----------
+x-airflow-common: &airflow-common
+  build: ./airflow
+  image: price-airflow:latest
+  environment: &airflow-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@postgres:5432/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully
+
+# ---------- Spark image (فيه Iceberg + S3 + Postgres JDBC + مكتبات بايثون) ----------
+x-spark-common: &spark-common
+  build: ./spark
+  image: price-spark:latest
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: us-east-1
+
+services:
+  # ================= Storage =================
+  minio:
+    image: ${MINIO_IMAGE}
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: scnd/mc-mirror:RELEASE.2025-02-04T04-57-50Z
+    container_name: minio-init
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done &&
+      mc mb --ignore-existing local/warehouse &&
+      mc mb --ignore-existing local/landing &&
+      echo 'buckets ready'
+      "
+
+  # ================= Database =================
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  adminer:
+    image: adminer
+    container_name: adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ================= Iceberg catalog =================
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      <<: *s3-env
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:sqlite:file:/data/iceberg_catalog.db
+      CATALOG_JDBC_INIT__CATALOG__TABLES: "true"
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    volumes:
+      - iceberg-catalog:/data
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  # ================= Spark =================
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    environment:
+      <<: *s3-env
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+
+  spark-worker:
+    <<: *spark-common
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker --cores 2 --memory 2g spark://spark-master:7077
+    environment:
+      <<: *s3-env
+    depends_on:
+      - spark-master
+
+  # ================= Python (scrapers + spark driver) =================
+  python:
+    <<: *spark-common
+    container_name: python-container
+    command: tail -f /dev/null
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      <<: *s3-env
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      - spark-master
+      - minio-init
+
+  # ================= Airflow =================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: db migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: airflow-api-server
+    command: api-server
+    ports:
+      - "8082:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    group_add:
+      - "${DOCKER_GID:-0}"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock   # عشان التاسكات تعمل docker exec على python-container
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+
+volumes:
+  minio-data:
+  postgres-data:
+  iceberg-catalog:
+  airflow-logs:
